@@ -1,7 +1,3 @@
-/* smp - Simple Music Player for OpenBSD
- * ANSI C89 compliant terminal music player following suckless philosophy
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
