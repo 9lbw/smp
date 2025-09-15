@@ -98,9 +98,26 @@ typedef struct {
     short *buffer;
     size_t buffer_pos;
     size_t buffer_size;
+    size_t buffer_capacity;
     Metadata *meta;
+    long total_samples;
+    int bits_per_sample;
 } FlacData;
 
+static FLAC__StreamDecoderReadStatus flac_read_callback(
+    const FLAC__StreamDecoder *decoder, FLAC__byte buffer[], 
+    size_t *bytes, void *client_data);
+static FLAC__StreamDecoderSeekStatus flac_seek_callback(
+    const FLAC__StreamDecoder *decoder, FLAC__uint64 absolute_byte_offset,
+    void *client_data);
+static FLAC__StreamDecoderTellStatus flac_tell_callback(
+    const FLAC__StreamDecoder *decoder, FLAC__uint64 *absolute_byte_offset,
+    void *client_data);
+static FLAC__StreamDecoderLengthStatus flac_length_callback(
+    const FLAC__StreamDecoder *decoder, FLAC__uint64 *stream_length,
+    void *client_data);
+static FLAC__bool flac_eof_callback(const FLAC__StreamDecoder *decoder,
+    void *client_data);
 static FLAC__StreamDecoderWriteStatus flac_write_callback(
     const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame,
     const FLAC__int32 * const buffer[], void *client_data);
@@ -397,27 +414,365 @@ static void mp3_cleanup(void *handle)
     mpg123_exit();
 }
 
-/* FLAC implementation stub - simplified for brevity */
+/* FLAC implementation */
+static FLAC__StreamDecoderReadStatus flac_read_callback(
+    const FLAC__StreamDecoder *decoder, FLAC__byte buffer[], 
+    size_t *bytes, void *client_data)
+{
+    FlacData *data = (FlacData *)client_data;
+    size_t read_bytes;
+    
+    (void)decoder;
+    
+    if (*bytes > 0) {
+        read_bytes = fread(buffer, sizeof(FLAC__byte), *bytes, data->file);
+        if (ferror(data->file)) {
+            return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
+        } else if (read_bytes == 0) {
+            return FLAC__STREAM_DECODER_READ_STATUS_END_OF_STREAM;
+        }
+        *bytes = read_bytes;
+        return FLAC__STREAM_DECODER_READ_STATUS_CONTINUE;
+    }
+    
+    return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
+}
+
+static FLAC__StreamDecoderSeekStatus flac_seek_callback(
+    const FLAC__StreamDecoder *decoder, FLAC__uint64 absolute_byte_offset,
+    void *client_data)
+{
+    FlacData *data = (FlacData *)client_data;
+    
+    (void)decoder;
+    
+    if (fseek(data->file, (long)absolute_byte_offset, SEEK_SET) < 0) {
+        return FLAC__STREAM_DECODER_SEEK_STATUS_ERROR;
+    }
+    
+    return FLAC__STREAM_DECODER_SEEK_STATUS_OK;
+}
+
+static FLAC__StreamDecoderTellStatus flac_tell_callback(
+    const FLAC__StreamDecoder *decoder, FLAC__uint64 *absolute_byte_offset,
+    void *client_data)
+{
+    FlacData *data = (FlacData *)client_data;
+    long pos;
+    
+    (void)decoder;
+    
+    pos = ftell(data->file);
+    if (pos < 0) {
+        return FLAC__STREAM_DECODER_TELL_STATUS_ERROR;
+    }
+    
+    *absolute_byte_offset = (FLAC__uint64)pos;
+    return FLAC__STREAM_DECODER_TELL_STATUS_OK;
+}
+
+static FLAC__StreamDecoderLengthStatus flac_length_callback(
+    const FLAC__StreamDecoder *decoder, FLAC__uint64 *stream_length,
+    void *client_data)
+{
+    FlacData *data = (FlacData *)client_data;
+    long pos, length;
+    
+    (void)decoder;
+    
+    pos = ftell(data->file);
+    if (fseek(data->file, 0, SEEK_END) < 0) {
+        return FLAC__STREAM_DECODER_LENGTH_STATUS_ERROR;
+    }
+    
+    length = ftell(data->file);
+    if (length < 0) {
+        return FLAC__STREAM_DECODER_LENGTH_STATUS_ERROR;
+    }
+    
+    if (fseek(data->file, pos, SEEK_SET) < 0) {
+        return FLAC__STREAM_DECODER_LENGTH_STATUS_ERROR;
+    }
+    
+    *stream_length = (FLAC__uint64)length;
+    return FLAC__STREAM_DECODER_LENGTH_STATUS_OK;
+}
+
+static FLAC__bool flac_eof_callback(const FLAC__StreamDecoder *decoder,
+    void *client_data)
+{
+    FlacData *data = (FlacData *)client_data;
+    
+    (void)decoder;
+    
+    return feof(data->file) ? 1 : 0;
+}
+
+static FLAC__StreamDecoderWriteStatus flac_write_callback(
+    const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame,
+    const FLAC__int32 * const buffer[], void *client_data)
+{
+    FlacData *data = (FlacData *)client_data;
+    size_t samples = frame->header.blocksize;
+    unsigned int channels = frame->header.channels;
+    unsigned int i, j, k;
+    short *out_ptr;
+    
+    (void)decoder;
+    
+    /* Expand buffer if needed */
+    if (data->buffer_size + samples * channels > data->buffer_capacity) {
+        size_t new_capacity = data->buffer_capacity * 2;
+        short *new_buffer;
+        
+        if (new_capacity < data->buffer_size + samples * channels) {
+            new_capacity = data->buffer_size + samples * channels;
+        }
+        
+        new_buffer = realloc(data->buffer, new_capacity * sizeof(short));
+        if (!new_buffer) {
+            return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
+        }
+        
+        data->buffer = new_buffer;
+        data->buffer_capacity = new_capacity;
+    }
+    
+    out_ptr = data->buffer + data->buffer_size;
+    
+    /* Convert FLAC samples to 16-bit PCM */
+    for (i = 0; i < samples; i++) {
+        for (j = 0; j < channels; j++) {
+            FLAC__int32 sample = buffer[j][i];
+            
+            /* Scale samples to 16-bit */
+            if (data->bits_per_sample == 16) {
+                *out_ptr++ = (short)sample;
+            } else if (data->bits_per_sample == 24) {
+                *out_ptr++ = (short)(sample >> 8);
+            } else if (data->bits_per_sample == 32) {
+                *out_ptr++ = (short)(sample >> 16);
+            } else if (data->bits_per_sample == 8) {
+                *out_ptr++ = (short)(sample << 8);
+            } else {
+                /* Generic scaling for other bit depths */
+                int shift = data->bits_per_sample - 16;
+                if (shift > 0) {
+                    *out_ptr++ = (short)(sample >> shift);
+                } else {
+                    *out_ptr++ = (short)(sample << -shift);
+                }
+            }
+        }
+    }
+    
+    data->buffer_size += samples * channels;
+    
+    return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
+}
+
+static void flac_metadata_callback(const FLAC__StreamDecoder *decoder,
+    const FLAC__StreamMetadata *metadata, void *client_data)
+{
+    FlacData *data = (FlacData *)client_data;
+    unsigned int i;
+    
+    (void)decoder;
+    
+    if (metadata->type == FLAC__METADATA_TYPE_STREAMINFO) {
+        data->meta->sample_rate = metadata->data.stream_info.sample_rate;
+        data->meta->channels = metadata->data.stream_info.channels;
+        data->bits_per_sample = metadata->data.stream_info.bits_per_sample;
+        data->total_samples = metadata->data.stream_info.total_samples;
+        
+        if (data->total_samples > 0 && data->meta->sample_rate > 0) {
+            data->meta->duration_ms = (data->total_samples * 1000) / data->meta->sample_rate;
+        }
+        
+        /* Calculate average bitrate */
+        if (data->meta->duration_ms > 0) {
+            long file_size;
+            long pos = ftell(data->file);
+            fseek(data->file, 0, SEEK_END);
+            file_size = ftell(data->file);
+            fseek(data->file, pos, SEEK_SET);
+            
+            if (file_size > 0) {
+                data->meta->bitrate = (int)((file_size * 8000) / data->meta->duration_ms);
+            }
+        }
+    } else if (metadata->type == FLAC__METADATA_TYPE_VORBIS_COMMENT) {
+        for (i = 0; i < metadata->data.vorbis_comment.num_comments; i++) {
+            char *comment = (char *)metadata->data.vorbis_comment.comments[i].entry;
+            
+            if (strncasecmp(comment, "ARTIST=", 7) == 0) {
+                data->meta->artist = strdup(comment + 7);
+            } else if (strncasecmp(comment, "TITLE=", 6) == 0) {
+                data->meta->title = strdup(comment + 6);
+            } else if (strncasecmp(comment, "ALBUM=", 6) == 0) {
+                data->meta->album = strdup(comment + 6);
+            }
+        }
+    }
+}
+
+static void flac_error_callback(const FLAC__StreamDecoder *decoder,
+    FLAC__StreamDecoderErrorStatus status, void *client_data)
+{
+    (void)decoder;
+    (void)client_data;
+    
+    fprintf(stderr, "FLAC decoder error: %s\n", 
+            FLAC__StreamDecoderErrorStatusString[status]);
+}
+
 static Decoder* open_flac(const char *filename)
 {
-    /* FLAC implementation would go here */
-    /* Due to complexity, providing a stub */
-    (void)filename;
-    fprintf(stderr, "FLAC support not fully implemented in this example\n");
-    return NULL;
+    FlacData *data;
+    Decoder *dec;
+    FLAC__StreamDecoderInitStatus init_status;
+    
+    data = calloc(1, sizeof(FlacData));
+    if (!data) {
+        return NULL;
+    }
+    
+    data->file = fopen(filename, "rb");
+    if (!data->file) {
+        free(data);
+        return NULL;
+    }
+    
+    dec = calloc(1, sizeof(Decoder));
+    if (!dec) {
+        fclose(data->file);
+        free(data);
+        return NULL;
+    }
+    
+    data->meta = &dec->meta;
+    data->buffer_capacity = BUF_SIZE * 4;
+    data->buffer = malloc(data->buffer_capacity * sizeof(short));
+    if (!data->buffer) {
+        fclose(data->file);
+        free(data);
+        free(dec);
+        return NULL;
+    }
+    
+    data->decoder = FLAC__stream_decoder_new();
+    if (!data->decoder) {
+        free(data->buffer);
+        fclose(data->file);
+        free(data);
+        free(dec);
+        return NULL;
+    }
+    
+    FLAC__stream_decoder_set_md5_checking(data->decoder, 0);
+    
+    init_status = FLAC__stream_decoder_init_stream(
+        data->decoder,
+        flac_read_callback,
+        flac_seek_callback,
+        flac_tell_callback,
+        flac_length_callback,
+        flac_eof_callback,
+        flac_write_callback,
+        flac_metadata_callback,
+        flac_error_callback,
+        data
+    );
+    
+    if (init_status != FLAC__STREAM_DECODER_INIT_STATUS_OK) {
+        fprintf(stderr, "Failed to initialize FLAC decoder: %s\n",
+                FLAC__StreamDecoderInitStatusString[init_status]);
+        FLAC__stream_decoder_delete(data->decoder);
+        free(data->buffer);
+        fclose(data->file);
+        free(data);
+        free(dec);
+        return NULL;
+    }
+    
+    /* Process metadata to get stream info */
+    if (!FLAC__stream_decoder_process_until_end_of_metadata(data->decoder)) {
+        FLAC__stream_decoder_delete(data->decoder);
+        free(data->buffer);
+        fclose(data->file);
+        free(data);
+        free(dec);
+        return NULL;
+    }
+    
+    dec->handle = data;
+    dec->format = FMT_FLAC;
+    dec->decode = flac_decode;
+    dec->cleanup = flac_cleanup;
+    dec->total_samples = data->total_samples;
+    
+    return dec;
 }
 
 static int flac_decode(void *handle, short *buffer, size_t frames)
 {
-    (void)handle;
-    (void)buffer;
-    (void)frames;
-    return 0;
+    FlacData *data = (FlacData *)handle;
+    size_t samples_needed = frames;
+    size_t samples_copied = 0;
+    
+    while (samples_copied < samples_needed) {
+        /* If we have buffered samples, copy them */
+        if (data->buffer_pos < data->buffer_size) {
+            size_t to_copy = data->buffer_size - data->buffer_pos;
+            if (to_copy > samples_needed - samples_copied) {
+                to_copy = samples_needed - samples_copied;
+            }
+            
+            memcpy(buffer + samples_copied, 
+                   data->buffer + data->buffer_pos, 
+                   to_copy * sizeof(short));
+            
+            data->buffer_pos += to_copy;
+            samples_copied += to_copy;
+        } else {
+            /* Need to decode more data */
+            data->buffer_pos = 0;
+            data->buffer_size = 0;
+            
+            if (!FLAC__stream_decoder_process_single(data->decoder)) {
+                break;
+            }
+            
+            if (FLAC__stream_decoder_get_state(data->decoder) == 
+                FLAC__STREAM_DECODER_END_OF_STREAM) {
+                break;
+            }
+            
+            /* If no data was decoded, we're done */
+            if (data->buffer_size == 0) {
+                break;
+            }
+        }
+    }
+    
+    return samples_copied;
 }
 
 static void flac_cleanup(void *handle)
 {
-    (void)handle;
+    FlacData *data = (FlacData *)handle;
+    
+    if (data) {
+        if (data->decoder) {
+            FLAC__stream_decoder_finish(data->decoder);
+            FLAC__stream_decoder_delete(data->decoder);
+        }
+        if (data->file) {
+            fclose(data->file);
+        }
+        free(data->buffer);
+        free(data);
+    }
 }
 
 /* OGG Vorbis implementation */
