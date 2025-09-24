@@ -1,1028 +1,117 @@
+#include <errno.h>
+#include <sndfile.h>
+#include <sndio.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <signal.h>
-#include <time.h>
-#include <errno.h>
-#include <sndio.h>
-#include <termios.h>
-#include <sys/select.h>
-#include <sys/ioctl.h>
 
-/* Audio format libraries */
-#include <mpg123.h>
-#include <FLAC/stream_decoder.h>
-#include <vorbis/vorbisfile.h>
+#define BUF_FRAMES 4096     /* frames per read/write burst             */
+#define BPS        2        /* 16-bit signed little-endian PCM (s16le) */
 
-#define VERSION "0.1.0"
-#define SAMPLE_RATE 44100
-#define CHANNELS 2
-#define BUF_SIZE 4096
+static void
+die(const char *msg)
+{
+    perror(msg);
+    exit(EXIT_FAILURE);
+}
 
-/* Terminal control codes */
-#define CLEAR_LINE "\r\033[K"
-#define CURSOR_HIDE "\033[?25l"
-#define CURSOR_SHOW "\033[?25h"
-
-typedef enum {
-    FMT_UNKNOWN,
-    FMT_MP3,
-    FMT_FLAC,
-    FMT_OGG
-} AudioFormat;
-
-typedef enum {
-    STATE_STOPPED,
-    STATE_PLAYING,
-    STATE_PAUSED
-} PlayerState;
-
-typedef struct {
-    char *artist;
-    char *title;
-    char *album;
-    long duration_ms;
-    int sample_rate;
-    int channels;
-    int bitrate;
-} Metadata;
-
-typedef struct {
-    void *handle;
-    AudioFormat format;
-    Metadata meta;
-    long current_pos;
-    long total_samples;
-    int (*decode)(void *handle, short *buffer, size_t frames);
-    void (*cleanup)(void *handle);
-} Decoder;
-
-typedef struct {
-    struct sio_hdl *hdl;
+/* Open sndio with parameters matching the current track             */
+static struct sio_hdl *
+open_sndio(int rate, int ch)
+{
     struct sio_par par;
-    PlayerState state;
-    Decoder *decoder;
-    char *current_file;
-    volatile sig_atomic_t quit;
-    struct termios orig_term;
-} Player;
 
-/* Global player instance for signal handling */
-static Player *g_player = NULL;
+    struct sio_hdl *hdl = sio_open(NULL, SIO_PLAY, 0);
+    if (!hdl)
+        die("sio_open");
 
-/* Function prototypes */
-static void cleanup(Player *p);
-static void signal_handler(int sig);
-static int setup_terminal(Player *p);
-static void restore_terminal(Player *p);
-static int setup_audio(Player *p);
-static void close_audio(Player *p);
-static AudioFormat detect_format(const char *filename);
-static Decoder* open_decoder(const char *filename);
-static void close_decoder(Decoder *dec);
-static void display_status(Player *p);
-static void draw_progress_bar(long current, long total, int width);
-static int handle_input(Player *p);
-static void play_file(Player *p, const char *filename);
+    sio_initpar(&par);
+    par.bits  = 16;
+    par.sig   = 1;          /* signed */
+    par.le    = 1;          /* little-endian */
+    par.pchan = ch;
+    par.rate  = rate;
 
-/* MP3 decoder functions */
-static int mp3_decode(void *handle, short *buffer, size_t frames);
-static void mp3_cleanup(void *handle);
-static Decoder* open_mp3(const char *filename);
+    if (!sio_setpar(hdl, &par) || !sio_getpar(hdl, &par))
+        die("sio_setpar");
+    if (par.bits != 16 || par.sig != 1)
+        die("device does not support 16-bit signed audio");
 
-/* FLAC decoder functions */
-typedef struct {
-    FLAC__StreamDecoder *decoder;
-    FILE *file;
-    short *buffer;
-    size_t buffer_pos;
-    size_t buffer_size;
-    size_t buffer_capacity;
-    Metadata *meta;
-    long total_samples;
-    int bits_per_sample;
-} FlacData;
+    if (!sio_start(hdl))
+        die("sio_start");
 
-static FLAC__StreamDecoderReadStatus flac_read_callback(
-    const FLAC__StreamDecoder *decoder, FLAC__byte buffer[], 
-    size_t *bytes, void *client_data);
-static FLAC__StreamDecoderSeekStatus flac_seek_callback(
-    const FLAC__StreamDecoder *decoder, FLAC__uint64 absolute_byte_offset,
-    void *client_data);
-static FLAC__StreamDecoderTellStatus flac_tell_callback(
-    const FLAC__StreamDecoder *decoder, FLAC__uint64 *absolute_byte_offset,
-    void *client_data);
-static FLAC__StreamDecoderLengthStatus flac_length_callback(
-    const FLAC__StreamDecoder *decoder, FLAC__uint64 *stream_length,
-    void *client_data);
-static FLAC__bool flac_eof_callback(const FLAC__StreamDecoder *decoder,
-    void *client_data);
-static FLAC__StreamDecoderWriteStatus flac_write_callback(
-    const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame,
-    const FLAC__int32 * const buffer[], void *client_data);
-static void flac_metadata_callback(const FLAC__StreamDecoder *decoder,
-    const FLAC__StreamMetadata *metadata, void *client_data);
-static void flac_error_callback(const FLAC__StreamDecoder *decoder,
-    FLAC__StreamDecoderErrorStatus status, void *client_data);
-static int flac_decode(void *handle, short *buffer, size_t frames);
-static void flac_cleanup(void *handle);
-static Decoder* open_flac(const char *filename);
-
-/* OGG Vorbis decoder functions */
-static int ogg_decode(void *handle, short *buffer, size_t frames);
-static void ogg_cleanup(void *handle);
-static Decoder* open_ogg(const char *filename);
-
-/* Utility functions */
-static void format_time(long ms, char *buf, size_t size);
-static int term_width(void);
-
-int main(int argc, char *argv[])
-{
-    Player player;
-    int i;
-    
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <audio file> [audio file...]\n", argv[0]);
-        fprintf(stderr, "Supported formats: MP3, FLAC, OGG\n");
-        return 1;
-    }
-    
-    memset(&player, 0, sizeof(Player));
-    g_player = &player;
-    
-    /* Setup signal handlers */
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-    
-    /* Initialize subsystems */
-    if (!setup_terminal(&player)) {
-        fprintf(stderr, "Failed to setup terminal\n");
-        return 1;
-    }
-    
-    if (!setup_audio(&player)) {
-        fprintf(stderr, "Failed to setup audio\n");
-        restore_terminal(&player);
-        return 1;
-    }
-    
-    printf(CURSOR_HIDE);
-    
-    /* Play files */
-    for (i = 1; i < argc && !player.quit; i++) {
-        play_file(&player, argv[i]);
-    }
-    
-    cleanup(&player);
-    return 0;
+    return hdl;
 }
 
-static void cleanup(Player *p)
+/* Print “Artist – Title” (or fallback to filename)                   */
+static void
+print_tags(SNDFILE *sf, const char *path)
 {
-    printf(CURSOR_SHOW);
-    printf("\n");
-    
-    if (p->decoder) {
-        close_decoder(p->decoder);
-    }
-    
-    close_audio(p);
-    restore_terminal(p);
-}
+    const char *title  = sf_get_string(sf, SF_STR_TITLE);
+    const char *artist = sf_get_string(sf, SF_STR_ARTIST);
 
-static void signal_handler(int sig)
-{
-    (void)sig;
-    if (g_player) {
-        g_player->quit = 1;
-    }
-}
+    if (title || artist)
+        printf("%s%s%s\n",
+               artist ? artist : "",
+               (artist && title) ? " – " : "",
+               title ? title : "");
+    else
+        printf("%s\n", path);
 
-static int setup_terminal(Player *p)
-{
-    struct termios new_term;
-    
-    if (tcgetattr(STDIN_FILENO, &p->orig_term) < 0) {
-        return 0;
-    }
-    
-    new_term = p->orig_term;
-    new_term.c_lflag &= ~(ICANON | ECHO);
-    new_term.c_cc[VMIN] = 0;
-    new_term.c_cc[VTIME] = 0;
-    
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &new_term) < 0) {
-        return 0;
-    }
-    
-    return 1;
-}
-
-static void restore_terminal(Player *p)
-{
-    tcsetattr(STDIN_FILENO, TCSANOW, &p->orig_term);
-}
-
-static int setup_audio(Player *p)
-{
-    p->hdl = sio_open(NULL, SIO_PLAY, 0);
-    if (!p->hdl) {
-        return 0;
-    }
-    
-    sio_initpar(&p->par);
-    p->par.rate = SAMPLE_RATE;
-    p->par.pchan = CHANNELS;
-    p->par.sig = 1;
-    p->par.le = SIO_LE_NATIVE;
-    p->par.bits = 16;
-    p->par.appbufsz = BUF_SIZE;
-    
-    if (!sio_setpar(p->hdl, &p->par)) {
-        sio_close(p->hdl);
-        return 0;
-    }
-    
-    if (!sio_start(p->hdl)) {
-        sio_close(p->hdl);
-        return 0;
-    }
-    
-    return 1;
-}
-
-static void close_audio(Player *p)
-{
-    if (p->hdl) {
-        sio_close(p->hdl);
-        p->hdl = NULL;
-    }
-}
-
-static AudioFormat detect_format(const char *filename)
-{
-    const char *ext = strrchr(filename, '.');
-    if (!ext) return FMT_UNKNOWN;
-    
-    ext++;
-    if (strcasecmp(ext, "mp3") == 0) return FMT_MP3;
-    if (strcasecmp(ext, "flac") == 0) return FMT_FLAC;
-    if (strcasecmp(ext, "ogg") == 0) return FMT_OGG;
-    
-    return FMT_UNKNOWN;
-}
-
-static Decoder* open_decoder(const char *filename)
-{
-    AudioFormat fmt = detect_format(filename);
-    
-    switch (fmt) {
-    case FMT_MP3:
-        return open_mp3(filename);
-    case FMT_FLAC:
-        return open_flac(filename);
-    case FMT_OGG:
-        return open_ogg(filename);
-    default:
-        return NULL;
-    }
-}
-
-static void close_decoder(Decoder *dec)
-{
-    if (dec) {
-        if (dec->cleanup && dec->handle) {
-            dec->cleanup(dec->handle);
-        }
-        free(dec->meta.artist);
-        free(dec->meta.title);
-        free(dec->meta.album);
-        free(dec);
-    }
-}
-
-/* MP3 implementation */
-static Decoder* open_mp3(const char *filename)
-{
-    mpg123_handle *mh;
-    Decoder *dec;
-    int err;
-    long rate;
-    int channels, encoding;
-    mpg123_id3v2 *v2;
-    mpg123_id3v1 *v1;
-    off_t length;
-    
-    if (mpg123_init() != MPG123_OK) {
-        return NULL;
-    }
-    
-    mh = mpg123_new(NULL, &err);
-    if (!mh) {
-        mpg123_exit();
-        return NULL;
-    }
-    
-    if (mpg123_open(mh, filename) != MPG123_OK) {
-        mpg123_delete(mh);
-        mpg123_exit();
-        return NULL;
-    }
-    
-    if (mpg123_getformat(mh, &rate, &channels, &encoding) != MPG123_OK) {
-        mpg123_close(mh);
-        mpg123_delete(mh);
-        mpg123_exit();
-        return NULL;
-    }
-    
-    mpg123_format_none(mh);
-    mpg123_format(mh, rate, channels, MPG123_ENC_SIGNED_16);
-    
-    dec = calloc(1, sizeof(Decoder));
-    if (!dec) {
-        mpg123_close(mh);
-        mpg123_delete(mh);
-        mpg123_exit();
-        return NULL;
-    }
-    
-    dec->handle = mh;
-    dec->format = FMT_MP3;
-    dec->decode = mp3_decode;
-    dec->cleanup = mp3_cleanup;
-    
-    /* Get metadata */
-    dec->meta.sample_rate = (int)rate;
-    dec->meta.channels = channels;
-    
-    mpg123_scan(mh);
-    length = mpg123_length(mh);
-    if (length > 0) {
-        dec->total_samples = length;
-        dec->meta.duration_ms = (length * 1000) / rate;
-    }
-    
-    if (mpg123_id3(mh, &v1, &v2) == MPG123_OK) {
-        if (v2) {
-            if (v2->artist && v2->artist->p) {
-                dec->meta.artist = strdup(v2->artist->p);
-            }
-            if (v2->title && v2->title->p) {
-                dec->meta.title = strdup(v2->title->p);
-            }
-            if (v2->album && v2->album->p) {
-                dec->meta.album = strdup(v2->album->p);
-            }
-        } else if (v1) {
-            if (v1->artist[0]) {
-                dec->meta.artist = strndup(v1->artist, 30);
-            }
-            if (v1->title[0]) {
-                dec->meta.title = strndup(v1->title, 30);
-            }
-            if (v1->album[0]) {
-                dec->meta.album = strndup(v1->album, 30);
-            }
-        }
-    }
-    
-    return dec;
-}
-
-static int mp3_decode(void *handle, short *buffer, size_t frames)
-{
-    mpg123_handle *mh = (mpg123_handle *)handle;
-    size_t done;
-    int err;
-    
-    err = mpg123_read(mh, (unsigned char *)buffer, frames * 2 * sizeof(short), &done);
-    if (err != MPG123_OK && err != MPG123_DONE) {
-        return 0;
-    }
-    
-    return done / sizeof(short);
-}
-
-static void mp3_cleanup(void *handle)
-{
-    mpg123_handle *mh = (mpg123_handle *)handle;
-    mpg123_close(mh);
-    mpg123_delete(mh);
-    mpg123_exit();
-}
-
-/* FLAC implementation */
-static FLAC__StreamDecoderReadStatus flac_read_callback(
-    const FLAC__StreamDecoder *decoder, FLAC__byte buffer[], 
-    size_t *bytes, void *client_data)
-{
-    FlacData *data = (FlacData *)client_data;
-    size_t read_bytes;
-    
-    (void)decoder;
-    
-    if (*bytes > 0) {
-        read_bytes = fread(buffer, sizeof(FLAC__byte), *bytes, data->file);
-        if (ferror(data->file)) {
-            return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
-        } else if (read_bytes == 0) {
-            return FLAC__STREAM_DECODER_READ_STATUS_END_OF_STREAM;
-        }
-        *bytes = read_bytes;
-        return FLAC__STREAM_DECODER_READ_STATUS_CONTINUE;
-    }
-    
-    return FLAC__STREAM_DECODER_READ_STATUS_ABORT;
-}
-
-static FLAC__StreamDecoderSeekStatus flac_seek_callback(
-    const FLAC__StreamDecoder *decoder, FLAC__uint64 absolute_byte_offset,
-    void *client_data)
-{
-    FlacData *data = (FlacData *)client_data;
-    
-    (void)decoder;
-    
-    if (fseek(data->file, (long)absolute_byte_offset, SEEK_SET) < 0) {
-        return FLAC__STREAM_DECODER_SEEK_STATUS_ERROR;
-    }
-    
-    return FLAC__STREAM_DECODER_SEEK_STATUS_OK;
-}
-
-static FLAC__StreamDecoderTellStatus flac_tell_callback(
-    const FLAC__StreamDecoder *decoder, FLAC__uint64 *absolute_byte_offset,
-    void *client_data)
-{
-    FlacData *data = (FlacData *)client_data;
-    long pos;
-    
-    (void)decoder;
-    
-    pos = ftell(data->file);
-    if (pos < 0) {
-        return FLAC__STREAM_DECODER_TELL_STATUS_ERROR;
-    }
-    
-    *absolute_byte_offset = (FLAC__uint64)pos;
-    return FLAC__STREAM_DECODER_TELL_STATUS_OK;
-}
-
-static FLAC__StreamDecoderLengthStatus flac_length_callback(
-    const FLAC__StreamDecoder *decoder, FLAC__uint64 *stream_length,
-    void *client_data)
-{
-    FlacData *data = (FlacData *)client_data;
-    long pos, length;
-    
-    (void)decoder;
-    
-    pos = ftell(data->file);
-    if (fseek(data->file, 0, SEEK_END) < 0) {
-        return FLAC__STREAM_DECODER_LENGTH_STATUS_ERROR;
-    }
-    
-    length = ftell(data->file);
-    if (length < 0) {
-        return FLAC__STREAM_DECODER_LENGTH_STATUS_ERROR;
-    }
-    
-    if (fseek(data->file, pos, SEEK_SET) < 0) {
-        return FLAC__STREAM_DECODER_LENGTH_STATUS_ERROR;
-    }
-    
-    *stream_length = (FLAC__uint64)length;
-    return FLAC__STREAM_DECODER_LENGTH_STATUS_OK;
-}
-
-static FLAC__bool flac_eof_callback(const FLAC__StreamDecoder *decoder,
-    void *client_data)
-{
-    FlacData *data = (FlacData *)client_data;
-    
-    (void)decoder;
-    
-    return feof(data->file) ? 1 : 0;
-}
-
-static FLAC__StreamDecoderWriteStatus flac_write_callback(
-    const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame,
-    const FLAC__int32 * const buffer[], void *client_data)
-{
-    FlacData *data = (FlacData *)client_data;
-    size_t samples = frame->header.blocksize;
-    unsigned int channels = frame->header.channels;
-    unsigned int i, j, k;
-    short *out_ptr;
-    
-    (void)decoder;
-    
-    /* Expand buffer if needed */
-    if (data->buffer_size + samples * channels > data->buffer_capacity) {
-        size_t new_capacity = data->buffer_capacity * 2;
-        short *new_buffer;
-        
-        if (new_capacity < data->buffer_size + samples * channels) {
-            new_capacity = data->buffer_size + samples * channels;
-        }
-        
-        new_buffer = realloc(data->buffer, new_capacity * sizeof(short));
-        if (!new_buffer) {
-            return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
-        }
-        
-        data->buffer = new_buffer;
-        data->buffer_capacity = new_capacity;
-    }
-    
-    out_ptr = data->buffer + data->buffer_size;
-    
-    /* Convert FLAC samples to 16-bit PCM */
-    for (i = 0; i < samples; i++) {
-        for (j = 0; j < channels; j++) {
-            FLAC__int32 sample = buffer[j][i];
-            
-            /* Scale samples to 16-bit */
-            if (data->bits_per_sample == 16) {
-                *out_ptr++ = (short)sample;
-            } else if (data->bits_per_sample == 24) {
-                *out_ptr++ = (short)(sample >> 8);
-            } else if (data->bits_per_sample == 32) {
-                *out_ptr++ = (short)(sample >> 16);
-            } else if (data->bits_per_sample == 8) {
-                *out_ptr++ = (short)(sample << 8);
-            } else {
-                /* Generic scaling for other bit depths */
-                int shift = data->bits_per_sample - 16;
-                if (shift > 0) {
-                    *out_ptr++ = (short)(sample >> shift);
-                } else {
-                    *out_ptr++ = (short)(sample << -shift);
-                }
-            }
-        }
-    }
-    
-    data->buffer_size += samples * channels;
-    
-    return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
-}
-
-static void flac_metadata_callback(const FLAC__StreamDecoder *decoder,
-    const FLAC__StreamMetadata *metadata, void *client_data)
-{
-    FlacData *data = (FlacData *)client_data;
-    unsigned int i;
-    
-    (void)decoder;
-    
-    if (metadata->type == FLAC__METADATA_TYPE_STREAMINFO) {
-        data->meta->sample_rate = metadata->data.stream_info.sample_rate;
-        data->meta->channels = metadata->data.stream_info.channels;
-        data->bits_per_sample = metadata->data.stream_info.bits_per_sample;
-        data->total_samples = metadata->data.stream_info.total_samples;
-        
-        if (data->total_samples > 0 && data->meta->sample_rate > 0) {
-            data->meta->duration_ms = (data->total_samples * 1000) / data->meta->sample_rate;
-        }
-        
-        /* Calculate average bitrate */
-        if (data->meta->duration_ms > 0) {
-            long file_size;
-            long pos = ftell(data->file);
-            fseek(data->file, 0, SEEK_END);
-            file_size = ftell(data->file);
-            fseek(data->file, pos, SEEK_SET);
-            
-            if (file_size > 0) {
-                data->meta->bitrate = (int)((file_size * 8000) / data->meta->duration_ms);
-            }
-        }
-    } else if (metadata->type == FLAC__METADATA_TYPE_VORBIS_COMMENT) {
-        for (i = 0; i < metadata->data.vorbis_comment.num_comments; i++) {
-            char *comment = (char *)metadata->data.vorbis_comment.comments[i].entry;
-            
-            if (strncasecmp(comment, "ARTIST=", 7) == 0) {
-                data->meta->artist = strdup(comment + 7);
-            } else if (strncasecmp(comment, "TITLE=", 6) == 0) {
-                data->meta->title = strdup(comment + 6);
-            } else if (strncasecmp(comment, "ALBUM=", 6) == 0) {
-                data->meta->album = strdup(comment + 6);
-            }
-        }
-    }
-}
-
-static void flac_error_callback(const FLAC__StreamDecoder *decoder,
-    FLAC__StreamDecoderErrorStatus status, void *client_data)
-{
-    (void)decoder;
-    (void)client_data;
-    
-    fprintf(stderr, "FLAC decoder error: %s\n", 
-            FLAC__StreamDecoderErrorStatusString[status]);
-}
-
-static Decoder* open_flac(const char *filename)
-{
-    FlacData *data;
-    Decoder *dec;
-    FLAC__StreamDecoderInitStatus init_status;
-    
-    data = calloc(1, sizeof(FlacData));
-    if (!data) {
-        return NULL;
-    }
-    
-    data->file = fopen(filename, "rb");
-    if (!data->file) {
-        free(data);
-        return NULL;
-    }
-    
-    dec = calloc(1, sizeof(Decoder));
-    if (!dec) {
-        fclose(data->file);
-        free(data);
-        return NULL;
-    }
-    
-    data->meta = &dec->meta;
-    data->buffer_capacity = BUF_SIZE * 4;
-    data->buffer = malloc(data->buffer_capacity * sizeof(short));
-    if (!data->buffer) {
-        fclose(data->file);
-        free(data);
-        free(dec);
-        return NULL;
-    }
-    
-    data->decoder = FLAC__stream_decoder_new();
-    if (!data->decoder) {
-        free(data->buffer);
-        fclose(data->file);
-        free(data);
-        free(dec);
-        return NULL;
-    }
-    
-    FLAC__stream_decoder_set_md5_checking(data->decoder, 0);
-    
-    init_status = FLAC__stream_decoder_init_stream(
-        data->decoder,
-        flac_read_callback,
-        flac_seek_callback,
-        flac_tell_callback,
-        flac_length_callback,
-        flac_eof_callback,
-        flac_write_callback,
-        flac_metadata_callback,
-        flac_error_callback,
-        data
-    );
-    
-    if (init_status != FLAC__STREAM_DECODER_INIT_STATUS_OK) {
-        fprintf(stderr, "Failed to initialize FLAC decoder: %s\n",
-                FLAC__StreamDecoderInitStatusString[init_status]);
-        FLAC__stream_decoder_delete(data->decoder);
-        free(data->buffer);
-        fclose(data->file);
-        free(data);
-        free(dec);
-        return NULL;
-    }
-    
-    /* Process metadata to get stream info */
-    if (!FLAC__stream_decoder_process_until_end_of_metadata(data->decoder)) {
-        FLAC__stream_decoder_delete(data->decoder);
-        free(data->buffer);
-        fclose(data->file);
-        free(data);
-        free(dec);
-        return NULL;
-    }
-    
-    dec->handle = data;
-    dec->format = FMT_FLAC;
-    dec->decode = flac_decode;
-    dec->cleanup = flac_cleanup;
-    dec->total_samples = data->total_samples;
-    
-    return dec;
-}
-
-static int flac_decode(void *handle, short *buffer, size_t frames)
-{
-    FlacData *data = (FlacData *)handle;
-    size_t samples_needed = frames;
-    size_t samples_copied = 0;
-    
-    while (samples_copied < samples_needed) {
-        /* If we have buffered samples, copy them */
-        if (data->buffer_pos < data->buffer_size) {
-            size_t to_copy = data->buffer_size - data->buffer_pos;
-            if (to_copy > samples_needed - samples_copied) {
-                to_copy = samples_needed - samples_copied;
-            }
-            
-            memcpy(buffer + samples_copied, 
-                   data->buffer + data->buffer_pos, 
-                   to_copy * sizeof(short));
-            
-            data->buffer_pos += to_copy;
-            samples_copied += to_copy;
-        } else {
-            /* Need to decode more data */
-            data->buffer_pos = 0;
-            data->buffer_size = 0;
-            
-            if (!FLAC__stream_decoder_process_single(data->decoder)) {
-                break;
-            }
-            
-            if (FLAC__stream_decoder_get_state(data->decoder) == 
-                FLAC__STREAM_DECODER_END_OF_STREAM) {
-                break;
-            }
-            
-            /* If no data was decoded, we're done */
-            if (data->buffer_size == 0) {
-                break;
-            }
-        }
-    }
-    
-    return samples_copied;
-}
-
-static void flac_cleanup(void *handle)
-{
-    FlacData *data = (FlacData *)handle;
-    
-    if (data) {
-        if (data->decoder) {
-            FLAC__stream_decoder_finish(data->decoder);
-            FLAC__stream_decoder_delete(data->decoder);
-        }
-        if (data->file) {
-            fclose(data->file);
-        }
-        free(data->buffer);
-        free(data);
-    }
-}
-
-/* OGG Vorbis implementation */
-static Decoder* open_ogg(const char *filename)
-{
-    OggVorbis_File *vf;
-    vorbis_info *vi;
-    vorbis_comment *vc;
-    Decoder *dec;
-    char **ptr;
-    
-    vf = malloc(sizeof(OggVorbis_File));
-    if (!vf) return NULL;
-    
-    if (ov_fopen(filename, vf) < 0) {
-        free(vf);
-        return NULL;
-    }
-    
-    vi = ov_info(vf, -1);
-    if (!vi) {
-        ov_clear(vf);
-        free(vf);
-        return NULL;
-    }
-    
-    dec = calloc(1, sizeof(Decoder));
-    if (!dec) {
-        ov_clear(vf);
-        free(vf);
-        return NULL;
-    }
-    
-    dec->handle = vf;
-    dec->format = FMT_OGG;
-    dec->decode = ogg_decode;
-    dec->cleanup = ogg_cleanup;
-    
-    dec->meta.sample_rate = vi->rate;
-    dec->meta.channels = vi->channels;
-    dec->meta.bitrate = vi->bitrate_nominal;
-    
-    dec->total_samples = ov_pcm_total(vf, -1);
-    dec->meta.duration_ms = (dec->total_samples * 1000) / vi->rate;
-    
-    /* Get metadata */
-    vc = ov_comment(vf, -1);
-    if (vc) {
-        ptr = vc->user_comments;
-        while (*ptr) {
-            if (strncasecmp(*ptr, "ARTIST=", 7) == 0) {
-                dec->meta.artist = strdup(*ptr + 7);
-            } else if (strncasecmp(*ptr, "TITLE=", 6) == 0) {
-                dec->meta.title = strdup(*ptr + 6);
-            } else if (strncasecmp(*ptr, "ALBUM=", 6) == 0) {
-                dec->meta.album = strdup(*ptr + 6);
-            }
-            ptr++;
-        }
-    }
-    
-    return dec;
-}
-
-static int ogg_decode(void *handle, short *buffer, size_t frames)
-{
-    OggVorbis_File *vf = (OggVorbis_File *)handle;
-    int current_section;
-    long total = 0;
-    long to_read = frames * 2 * sizeof(short);
-    long ret;
-    
-    while (total < to_read) {
-        ret = ov_read(vf, (char *)buffer + total, to_read - total,
-                     0, 2, 1, &current_section);
-        if (ret <= 0) break;
-        total += ret;
-    }
-    
-    return total / sizeof(short);
-}
-
-static void ogg_cleanup(void *handle)
-{
-    OggVorbis_File *vf = (OggVorbis_File *)handle;
-    ov_clear(vf);
-    free(vf);
-}
-
-static void display_status(Player *p)
-{
-    char time_cur[16], time_tot[16];
-    int width;
-    long current_ms, total_ms;
-    
-    if (!p->decoder) return;
-    
-    width = term_width();
-    current_ms = (p->decoder->current_pos * 1000) / p->decoder->meta.sample_rate;
-    total_ms = p->decoder->meta.duration_ms;
-    
-    format_time(current_ms, time_cur, sizeof(time_cur));
-    format_time(total_ms, time_tot, sizeof(time_tot));
-    
-    printf(CLEAR_LINE);
-    
-    /* Display metadata */
-    if (p->decoder->meta.artist && p->decoder->meta.title) {
-        printf("%s - %s\n", p->decoder->meta.artist, p->decoder->meta.title);
-    } else if (p->current_file) {
-        const char *basename = strrchr(p->current_file, '/');
-        printf("%s\n", basename ? basename + 1 : p->current_file);
-    }
-    
-    /* Display progress bar */
-    printf("%s [", time_cur);
-    draw_progress_bar(current_ms, total_ms, width - 20);
-    printf("] %s", time_tot);
-    
-    /* Display state */
-    switch (p->state) {
-    case STATE_PAUSED:
-        printf(" [PAUSED]");
-        break;
-    case STATE_STOPPED:
-        printf(" [STOPPED]");
-        break;
-    default:
-        break;
-    }
-    
-    printf("\r\033[1A");  /* Move cursor up one line */
     fflush(stdout);
 }
 
-static void draw_progress_bar(long current, long total, int width)
+/* Play one file; returns 0 on success, non-zero on fatal error       */
+static int
+play_file(const char *path)
 {
-    int filled, i;
-    
-    if (total <= 0 || width <= 0) return;
-    
-    filled = (int)((current * width) / total);
-    if (filled > width) filled = width;
-    
-    for (i = 0; i < width; i++) {
-        if (i < filled) {
-            printf("=");
-        } else if (i == filled) {
-            printf(">");
-        } else {
-            printf("-");
-        }
+    SF_INFO info   = {0};
+    SNDFILE *sf    = sf_open(path, SFM_READ, &info);
+    if (!sf) {
+        fprintf(stderr, "%s: %s\n", path, sf_strerror(NULL));
+        return 1;
     }
-}
 
-static int handle_input(Player *p)
-{
-    char c;
-    fd_set fds;
-    struct timeval tv;
-    
-    FD_ZERO(&fds);
-    FD_SET(STDIN_FILENO, &fds);
-    tv.tv_sec = 0;
-    tv.tv_usec = 0;
-    
-    if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0) {
-        if (read(STDIN_FILENO, &c, 1) == 1) {
-            switch (c) {
-            case ' ':  /* Toggle pause */
-                if (p->state == STATE_PLAYING) {
-                    p->state = STATE_PAUSED;
-                    sio_stop(p->hdl);
-                } else if (p->state == STATE_PAUSED) {
-                    p->state = STATE_PLAYING;
-                    sio_start(p->hdl);
-                }
-                return 1;
-            case 'q':  /* Quit */
-            case 'Q':
-                p->quit = 1;
-                return 1;
-            case 'n':  /* Next track */
-            case 'N':
-                return -1;  /* Signal to skip track */
-            }
+    /* Print metadata                                                        */
+    print_tags(sf, path);
+
+    /* Prepare sndio                                                         */
+    struct sio_hdl *hdl = open_sndio(info.samplerate, info.channels);
+
+    /* I/O loop                                                              */
+    int16_t buf[BUF_FRAMES * info.channels];
+    sf_count_t frames;
+    while ((frames = sf_readf_short(sf, buf, BUF_FRAMES)) > 0) {
+        size_t to_write = (size_t)frames * info.channels * BPS;
+        const uint8_t *p = (const uint8_t *)buf;
+
+        while (to_write > 0) {
+            ssize_t n = sio_write(hdl, p, to_write);
+            if (n == 0)
+                die("sio_write");
+            p += n;
+            to_write -= (size_t)n;
         }
     }
-    
+
+    sio_close(hdl);
+    sf_close(sf);
     return 0;
 }
 
-static void play_file(Player *p, const char *filename)
+int
+main(int argc, char **argv)
 {
-    short buffer[BUF_SIZE];
-    int frames_read;
-    int input_result;
-    
-    printf("\nLoading: %s\n", filename);
-    
-    p->decoder = open_decoder(filename);
-    if (!p->decoder) {
-        fprintf(stderr, "Failed to open: %s\n", filename);
-        return;
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s file1 [file2 …]\n", argv[0]);
+        return EXIT_FAILURE;
     }
-    
-    p->current_file = (char *)filename;
-    p->state = STATE_PLAYING;
-    p->decoder->current_pos = 0;
-    
-    while (!p->quit && p->state != STATE_STOPPED) {
-        input_result = handle_input(p);
-        if (input_result < 0) break;  /* Skip to next track */
-        
-        if (p->state == STATE_PLAYING) {
-            frames_read = p->decoder->decode(p->decoder->handle, buffer, BUF_SIZE / 2);
-            if (frames_read <= 0) break;
-            
-            sio_write(p->hdl, buffer, frames_read * sizeof(short));
-            p->decoder->current_pos += frames_read / p->decoder->meta.channels;
-        } else {
-            usleep(50000);  /* Sleep 50ms when paused */
-        }
-        
-        display_status(p);
-    }
-    
-    close_decoder(p->decoder);
-    p->decoder = NULL;
-    p->current_file = NULL;
-    
-    printf("\n\n");
-}
 
-static void format_time(long ms, char *buf, size_t size)
-{
-    int min, sec;
-    
-    min = (int)(ms / 60000);
-    sec = (int)((ms % 60000) / 1000);
-    snprintf(buf, size, "%02d:%02d", min, sec);
-}
+    int rc = 0;
+    for (int i = 1; i < argc; i++)
+        rc |= play_file(argv[i]);
 
-static int term_width(void)
-{
-    struct winsize w;
-    
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == -1) {
-        return 80;  /* Default width */
-    }
-    
-    return w.ws_col;
+    return rc ? EXIT_FAILURE : EXIT_SUCCESS;
 }

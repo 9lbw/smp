@@ -1,43 +1,13 @@
-# Makefile for smp (Simple Music Player) - OpenBSD
-# ANSI C89 compliant
+PROG = smp
+SRCS = smp.c
 
-CC = cc
-CFLAGS = -Wall -Wextra -pedantic -ansi -O2
-LDFLAGS = -lsndio -lmpg123 -lFLAC -lvorbisfile -lvorbis -logg -lm
+SNDFILE_CFLAGS != pkg-config --cflags sndfile
+SNDFILE_LIBS   != pkg-config --libs   sndfile
 
-# Paths for OpenBSD ports/packages
-CFLAGS += -I/usr/local/include
-LDFLAGS += -L/usr/local/lib
+CFLAGS  += -Wall -O2 ${SNDFILE_CFLAGS}
+LDADD   += -lsndio ${SNDFILE_LIBS}
 
-TARGET = smp
-OBJS = smp.o
+# no manual page yet
+MAN =
 
-PREFIX = /usr/local
-BINDIR = $(PREFIX)/bin
-MANDIR = $(PREFIX)/man/man1
-
-all: $(TARGET)
-
-$(TARGET): $(OBJS)
-	$(CC) -o $@ $(OBJS) $(LDFLAGS)
-
-smp.o: smp.c
-	$(CC) $(CFLAGS) -c smp.c
-
-clean:
-	rm -f $(TARGET) $(OBJS)
-
-install: $(TARGET)
-	mkdir -p $(BINDIR)
-	install -m 755 $(TARGET) $(BINDIR)
-	@echo "Installed to $(BINDIR)/$(TARGET)"
-
-uninstall:
-	rm -f $(BINDIR)/$(TARGET)
-
-# OpenBSD package dependencies installation helper
-deps:
-	@echo "Installing required packages..."
-	@echo "Run as root: pkg_add mpg123 flac libvorbis"
-
-.PHONY: all clean install uninstall deps
+.include <bsd.prog.mk>
